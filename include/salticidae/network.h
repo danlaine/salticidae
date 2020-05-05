@@ -237,9 +237,16 @@ class MsgNetwork: public ConnPool {
     reg_handler(Func &&handler) {
         using callback_t = callback_traits<typename std::remove_reference<Func>::type>;
         set_handler(callback_t::msg_type::opcode,
-            [handler=std::forward<Func>(handler)](const Msg &msg, const conn_t &conn) {
-            handler(typename callback_t::msg_type(msg.get_payload()),
-                    static_pointer_cast<typename callback_t::conn_type>(conn));
+            [this, handler=std::forward<Func>(handler)](const Msg &msg, const conn_t &conn) {
+            try {
+                handler(typename callback_t::msg_type(msg.get_payload()),
+                        static_pointer_cast<typename callback_t::conn_type>(conn));
+            } catch (std::exception &e) {
+                SALTICIDAE_LOG_WARN(
+                    "error while parsing: %s, terminating the connection",
+                    e.what());
+                this->worker_terminate(conn);
+            }
         });
     }
 
@@ -359,11 +366,13 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
         Peer *peer;
         /* initialized and destroyed by the worker */
         TimerEvent ev_timeout;
+        bool manual; /* whether it is a temporary connection manually initiated
+                        by the user, only meanful in ACTIVE mode. */
 
         void reset_timeout(double timeout);
 
         public:
-        Conn(): MsgNet::Conn(), peer(nullptr) {}
+        Conn(): MsgNet::Conn(), peer(nullptr), manual(true) {}
         NetAddr get_peer_addr() {
             auto ret = *(static_cast<NetAddr *>(
                 get_net()->disp_tcall->call([this](ThreadCall::Handle &h) {
@@ -391,6 +400,32 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
 
     private:
 
+    struct MsgPing {
+        static const OpcodeType opcode;
+        DataStream serialized;
+        NetAddr claimed_addr;
+        uint32_t nonce;
+        MsgPing() { serialized << (uint8_t)false; }
+        MsgPing(const NetAddr &_claimed_addr, uint32_t _nonce) {
+            serialized << (uint8_t)true << _claimed_addr << htole(_nonce);
+        }
+        MsgPing(DataStream &&s) {
+            uint8_t flag;
+            s >> flag;
+            if (flag)
+                s >> claimed_addr >> nonce;
+            nonce = letoh(nonce);
+        }
+    };
+
+    struct MsgPong: public MsgPing {
+        static const OpcodeType opcode;
+        MsgPong(): MsgPing() {}
+        MsgPong(const NetAddr &_claimed_addr, uint32_t _nonce):
+            MsgPing(_claimed_addr, _nonce) {}
+        MsgPong(DataStream &&s): MsgPing(std::move(s)) {}
+    };
+
     struct Peer {
         PeerId id;
         NetAddr addr; /** remote address (if set) */
@@ -412,6 +447,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
         bool ping_timer_ok;
         bool pong_msg_ok;
         double ping_period;
+        BoxObj<MsgPing> inbound_preempt_ping;
 
         enum State {
             DISCONNECTED,
@@ -427,6 +463,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
             ev_ping_timer(
                 TimerEvent(pn->disp_ec, std::bind(&Peer::ping_timer, this, _1))),
             ping_period(pn->ping_period),
+            inbound_preempt_ping(nullptr),
             state(DISCONNECTED) {}
 
         Peer &operator=(const Peer &) = delete;
@@ -481,32 +518,6 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     const char *tty_secondary_color;
     const char *tty_tertiary_color;
     const char *tty_reset_color;
-
-    struct MsgPing {
-        static const OpcodeType opcode;
-        DataStream serialized;
-        NetAddr claimed_addr;
-        uint32_t nonce;
-        MsgPing() { serialized << (uint8_t)false; }
-        MsgPing(const NetAddr &_claimed_addr, uint32_t _nonce) {
-            serialized << (uint8_t)true << _claimed_addr << htole(_nonce);
-        }
-        MsgPing(DataStream &&s) {
-            uint8_t flag;
-            s >> flag;
-            if (flag)
-                s >> claimed_addr >> nonce;
-            nonce = letoh(nonce);
-        }
-    };
-
-    struct MsgPong: public MsgPing {
-        static const OpcodeType opcode;
-        MsgPong(): MsgPing() {}
-        MsgPong(const NetAddr &_claimed_addr, uint32_t _nonce):
-            MsgPing(_claimed_addr, _nonce) {}
-        MsgPong(DataStream &&s): MsgPing(std::move(s)) {}
-    };
 
     void ping_handler(MsgPing &&msg, const conn_t &conn);
     void pong_handler(MsgPong &&msg, const conn_t &conn);
@@ -626,7 +637,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     inline int32_t _multicast_msg(Msg &&msg, const std::vector<PeerId> &peers);
 
     void listen(NetAddr listen_addr);
-    conn_t connect(const NetAddr &addr) = delete;
+    //conn_t connect(const NetAddr &addr) = delete;
     template<typename Func>
     void reg_unknown_peer_handler(Func &&cb) { unknown_peer_cb = std::forward<Func>(cb); }
     template<typename Func>
@@ -784,7 +795,12 @@ void PeerNetwork<O, _, __>::on_dispatcher_setup(const ConnPool::conn_t &_conn) {
         auto pid = get_peer_id(conn, conn->get_addr());
         auto it = known_peers.find(pid);
         if (it == known_peers.end())
-            throw PeerNetworkError(SALTI_ERROR_PEER_NOT_MATCH);
+        {
+            if (conn->manual)
+                send_msg(MsgPing(listen_addr, 0), conn);
+            else
+                throw PeerNetworkError(SALTI_ERROR_PEER_NOT_MATCH);
+        }
         else
         {
             pinfo_slock_t _g(known_peers_lock);
@@ -809,7 +825,8 @@ void PeerNetwork<O, _, __>::on_dispatcher_teardown(const ConnPool::conn_t &_conn
             tty_reset_color,
             std::string(*conn).c_str());
     auto p = conn->peer;
-    if (!p) return;
+    if (!p || (conn->get_mode() == Conn::ConnMode::ACTIVE && conn->manual))
+        return;
     /* there are only two possible cases where p != nullptr:
      * 1. p2p is connected
      * 2. p2p is disconnected, but it is trying to do an active connection by
@@ -818,7 +835,6 @@ void PeerNetwork<O, _, __>::on_dispatcher_teardown(const ConnPool::conn_t &_conn
     {
         assert(p->conn == conn);
         p->state = Peer::State::DISCONNECTED;
-        p->inbound_conn = nullptr;
         p->outbound_conn = nullptr;
         p->ev_ping_timer.del();
         SALTICIDAE_LOG_INFO("%sended %s%s%s <-/-> %s%s%s (via %s)%s",
@@ -831,21 +847,35 @@ void PeerNetwork<O, _, __>::on_dispatcher_teardown(const ConnPool::conn_t &_conn
             tty_tertiary_color,
             std::string(*(p->conn)).c_str(),
             tty_reset_color);
+        if (p->inbound_preempt_ping)
+        {
+            this->user_tcall->async_call(
+                    [this, conn,
+                     iping=p->inbound_preempt_ping.unwrap(),
+                     iconn=p->inbound_conn](ThreadCall::Handle &) {
+                if (peer_cb) peer_cb(conn, false);
+                ping_handler(std::move(*iping), iconn);
+                delete iping;
+            });
+            p->inbound_conn = nullptr;
+            return;
+        }
         this->user_tcall->async_call([this, conn](ThreadCall::Handle &) {
             if (peer_cb) peer_cb(conn, false);
         });
+        p->inbound_conn = nullptr;
+        /* auto retry the connection */
+        if (p->cur_ntry > 0) p->cur_ntry--;
+        if (p->cur_ntry)
+        {
+            p->nonce = 0;
+            p->ev_retry_timer.add(
+                p->state == Peer::State::RESET ?
+                0 : gen_rand_timeout(p->retry_delay));
+        }
+        else
+            p->nonce = passive_nonce;
     }
-    /* auto retry the connection */
-    if (p->cur_ntry > 0) p->cur_ntry--;
-    if (p->cur_ntry)
-    {
-        p->nonce = 0;
-        p->ev_retry_timer.add(
-            p->state == Peer::State::RESET ?
-            0 : gen_rand_timeout(p->retry_delay));
-    }
-    else
-        p->nonce = passive_nonce;
 }
 
 template<typename O, O _, O __>
@@ -943,6 +973,9 @@ void PeerNetwork<O, _, __>::start_active_conn(Peer *p) {
     assert(!p->addr.is_null());
     auto conn = static_pointer_cast<Conn>(MsgNet::_connect(p->addr));
     conn->peer = p;
+    conn->manual = false;
+    if (p->outbound_conn)
+        this->disp_terminate(p->outbound_conn);
     p->outbound_conn = conn;
     assert(pending_peers.count(conn->get_addr()) == 0);
 }
@@ -981,9 +1014,17 @@ void PeerNetwork<O, _, __>::ping_handler(MsgPing &&msg, const conn_t &conn) {
                         this->disp_terminate(conn);
                         return;
                     }
+                    if (!msg.nonce) return; // ignore manual connection
                     auto &p = pit->second;
-                    if (p->state != Peer::State::DISCONNECTED ||
-                        (!p->addr.is_null() && p->addr != msg.claimed_addr)) return;
+                    if (p->state == Peer::State::CONNECTED)
+                    {
+                        // defer the handling of the inbound connection
+                        p->inbound_preempt_ping = new MsgPing(std::move(msg));
+                        p->inbound_conn = conn;
+                        this->disp_terminate(p->conn);
+                        return;
+                    }
+                    if (p->state != Peer::State::DISCONNECTED) return;
                     SALTICIDAE_LOG_DEBUG("%s%s%s: inbound handshake from %s%s%s",
                         tty_secondary_color, id_hex.c_str(), tty_reset_color,
                         tty_secondary_color, p->id_hex.c_str(), tty_reset_color);
